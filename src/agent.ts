@@ -10,7 +10,8 @@ const client = new OpenAI({
   baseURL: process.env.LLM_BASE_URL ?? "https://api.groq.com/openai/v1",
 });
 const MODEL = process.env.MODEL ?? "openai/gpt-oss-120b";
-const MAX_ROUNDS = 3; // hard cap on tool rounds; the last round is forced to answer
+const MAX_ROUNDS = 4;
+const MAX_SEARCHES = 12; // independent cap on admitted searches
 
 export type AgentEvent =
   | { type: "status"; text: string }
@@ -25,13 +26,13 @@ const TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
     function: {
       name: "web_search",
       description:
-        "Search the web. Returns up to 6 results with title, url, date (if known) and an excerpt. Call it several times in parallel for several entities.",
+        "Search the web. Returns up to 5 results with title, url, publication/retrieval dates and extracted page text (snippet fallback). Call it several times in parallel for several entities.",
       parameters: {
         type: "object",
         properties: {
           query: { type: "string", description: "Short, specific query. One entity or one question per call." },
           topic: { type: "string", enum: ["general", "news"] },
-          published_after: { type: "string", description: "YYYY-MM-DD. Only results published on/after this date. Use for 'what changed since X'." },
+          published_after: { type: "string", description: "YYYY-MM-DD. Only results published on/after this date. Use for dated announcements; omit for current pricing/docs." },
           published_before: { type: "string", description: "YYYY-MM-DD upper bound." },
         },
         required: ["query"],
@@ -46,7 +47,7 @@ const NUDGE: Msg = {
 };
 
 /** One streamed model call. withTools=false is used for the final, answer-only round. */
-async function streamRound(messages: Msg[], withTools: boolean, emit: (e: AgentEvent) => void) {
+async function streamRound(messages: Msg[], withTools: boolean, emit: (e: AgentEvent) => void, signal: AbortSignal) {
   const stream = await client.chat.completions.create({
     model: MODEL,
     messages,
@@ -54,14 +55,14 @@ async function streamRound(messages: Msg[], withTools: boolean, emit: (e: AgentE
     temperature: 0.3,
     max_completion_tokens: 2048,
     stream: true,
-  });
+  }, { signal, maxRetries: 0 });
   let content = "";
   const calls: { id: string; name: string; args: string }[] = [];
   for await (const chunk of stream) {
     const d = chunk.choices[0]?.delta;
     if (d?.content) {
       content += d.content;
-      emit({ type: "delta", text: d.content });
+      // Buffer until citations are validated and the round is known to be final.
     }
     for (const tc of d?.tool_calls ?? []) {
       const c = (calls[tc.index] ??= { id: "", name: "", args: "" });
@@ -93,6 +94,8 @@ export async function runAgent(opts: {
 }): Promise<{ text: string; sources: Source[] }> {
   const { emit } = opts;
   const now = new Date();
+  const signal = AbortSignal.timeout(60_000);
+  let searchCount = 0;
   const { resolved, recalled } = await temporalContext(opts.message, now, opts.sessionId);
   if (recalled.length) emit({ type: "status", text: "Recalling earlier conversation" });
 
@@ -105,13 +108,13 @@ export async function runAgent(opts: {
   let finalText = "";
 
   for (let round = 0; round < MAX_ROUNDS; round++) {
-    const last = round === MAX_ROUNDS - 1;
+    const last = round === MAX_ROUNDS - 1 || searchCount >= MAX_SEARCHES || Date.now() - now.getTime() > 40_000;
     let r;
     try {
-      r = await streamRound(last ? [...messages, NUDGE] : messages, !last, emit);
+      r = await streamRound(last ? [...messages, NUDGE] : messages, !last, emit, signal);
     } catch (e: any) {
       // Model emitted a malformed/forbidden tool call: don't crash, make it answer with what it has.
-      if (e?.code === "tool_use_failed" && !last) r = await streamRound([...messages, NUDGE], false, emit);
+      if (e?.code === "tool_use_failed" && !last) r = await streamRound([...messages, NUDGE], false, emit, signal);
       else throw e;
     }
     const { content, calls } = r;
@@ -127,12 +130,24 @@ export async function runAgent(opts: {
     });
 
     const parsed = calls.map((c) => {
-      try { return JSON.parse(c.args || "{}") as SearchArgs; } catch { return null; }
+      try {
+        const a = JSON.parse(c.args || "{}");
+        if (c.name !== "web_search" || typeof a.query !== "string" || !a.query.trim()) return null;
+        if (a.topic !== undefined && !["general", "news"].includes(a.topic)) return null;
+        for (const field of ["published_after", "published_before"]) {
+          if (a[field] !== undefined && (typeof a[field] !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(a[field]) || !Number.isFinite(Date.parse(a[field])))) return null;
+        }
+        return a as SearchArgs;
+      } catch { return null; }
     });
     emit({ type: "status", text: `Searching: ${parsed.map((a) => a?.query ?? "…").join(" · ")}` });
 
     // Parallel fan-out. Source ids are assigned after all results land, in call order, so numbering is deterministic.
-    const settled = await Promise.allSettled(parsed.map((a) => (a?.query ? webSearch(a) : Promise.reject(new Error("bad args")))));
+    const settled = await Promise.allSettled(parsed.map((a) => {
+      if (!a || searchCount >= MAX_SEARCHES) return Promise.reject(new Error("Invalid arguments or search budget exhausted"));
+      searchCount++;
+      return webSearch(a, signal);
+    }));
     calls.forEach((c, i) => {
       const r = settled[i];
       let out: string;
@@ -144,18 +159,29 @@ export async function runAgent(opts: {
           if (!id) {
             id = sources.length + 1;
             byUrl.set(h.url, id);
-            sources.push({ id, title: h.title, url: h.url, date: h.date });
+            sources.push({ id, title: h.title, url: h.url, date: h.date, retrievedAt: h.retrievedAt, evidence: h.content, contentKind: h.contentKind });
           }
-          return `[${id}] ${h.title}\n${h.url}${h.date ? `\npublished: ${h.date}` : ""}\n${h.content}`;
+          const source = sources[id - 1];
+          Object.assign(source, { retrievedAt: h.retrievedAt, evidence: h.content, contentKind: h.contentKind, date: h.date });
+          return JSON.stringify({ id, ...h });
         });
         out = lines.length
-          ? `<search_results untrusted="true" query="${parsed[i]!.query}">\n${lines.join("\n\n")}\n</search_results>`
+          ? `<search_results untrusted="true">\n${lines.join("\n\n")}\n</search_results>`
           : "No results. Try broader terms or drop the date filter.";
       }
       messages.push({ role: "tool", tool_call_id: c.id, content: out });
     });
   }
 
+  if (!finalText.trim()) throw new Error("Model returned no final answer");
+  const validIds = new Set(sources.map(s => s.id));
+  let invalid = false;
+  finalText = finalText.replace(/\[(\d+)\]/g, (citation, id) => {
+    if (validIds.has(Number(id))) return citation;
+    invalid = true; return "[source unavailable]";
+  });
+  if (invalid) finalText += "\n\nSome citations could not be validated; those claims need verification.";
+  emit({ type: "delta", text: finalText });
   // Only ship sources the answer actually cites.
   const cited = sources.filter((s) => finalText.includes(`[${s.id}]`));
   emit({ type: "sources", sources: cited });

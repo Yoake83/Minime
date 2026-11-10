@@ -1,39 +1,22 @@
 # DESIGN
 
-## What it is
-A streaming chat agent with one tool, `web_search`. The goal: answer fast, be right about *time*, and read like a person wrote it. The example questions ("has any of them changed since Monday?", "what did I ask on 3 Nov, is it still correct?") are all about **time and memory**, not just search, so that is where the architecture spends its effort.
+A research chat agent with exactly one model-facing tool, `web_search`. The challenge is both a memory problem and a freshness problem: establish what was actually said, then check the evidence today.
 
 ## How it works
-```
-user msg ─► temporal pre-step (no LLM, ~0 ms) ─► agent loop (≤4 rounds) ─► SSE stream
-              │ chrono-node: "last Tuesday" → 2026-11-03        │ model ⇄ parallel web_search
-              │ pull that day's exchanges from the log          │ last round forced to answer
-              ▼                                                 ▼
-        <recalled_conversations> + CURRENT DATE           cited sources [n], persisted with turn
-```
-1. **Temporal pre-step (deterministic).** Models are poor at calendar math and the only tool is web search, so it cannot look up its own past. The harness resolves date phrases to absolute dates and injects the stored exchanges from those days (across all sessions) plus the current date. "What did I ask on 3 Nov?" becomes a lookup, not a guess; if nothing exists, the model is told so and says it has no record instead of inventing one.
-2. **Timestamped history.** Every turn is stored with a timestamp, and past user messages are prefixed with when they were sent. "Since Monday" resolves against real dates, and "is your answer still correct" has a dated baseline (the old answer) to re-verify claim by claim.
-3. **One tool, shaped for the job.** `web_search(query, topic, published_after, published_before)`. The date filters turn "what changed since X" into a bounded search instead of hoping the ranker surfaces fresh pages. The prompt tells the model to fan out one search per entity *in parallel* (5 CRMs = 5 simultaneous calls), so latency is one round trip, not five.
-4. **Bounded loop.** Max 4 rounds; the final round sets `tool_choice: none` so it always ends with an answer. Searches are time-boxed (8 s), retried once, cached 10 min, and a failure becomes a tool error the model can explain rather than a crash.
-5. **Fast by default.** No router call, no planner call. Simple questions never touch the tool (the prompt defines when to search). The static system prompt is cache-controlled; per-request context (date, recalled turns) sits in a separate uncached block so the prefix stays hot. Tokens stream immediately; the UI shows a live "Searching: …" status.
-6. **Honest answers.** Citations use ids the harness issued, and only cited sources are shown. "No changes found" must name what was checked (absence of evidence ≠ no change). Search results are wrapped as untrusted data to blunt prompt injection.
 
-## Why this shape
-Quality here comes from *context engineering* more than from more machinery: the right date, the right history, the right filters. A dedicated router/planner/verifier pipeline adds latency and failure modes for a one-tool agent; the model already plans well when handed good context.
+1. **Recall before reasoning.** Chrono resolves past date phrases against an explicit timezone. The harness scans timestamped JSON logs within the same server-issued browser namespace, ranks exchanges by calendar day and lexical topic overlap, and includes adjacent exchanges to preserve shortlist corrections. At most 12 exchanges enter context. Candidates retain their real timestamps; a nearby conversation is not evidence that it happened on the requested day. The current chat also supplies its history. Local-day comparison avoids host-midnight errors.
+2. **One agent loop.** A static instruction prefix precedes the current date and recalled evidence. The model decides whether to search and fans independent entity queries out in parallel. No extra router, planner or critic calls. Four model rounds maximum; the final round has no tools and explicitly permits partial verification.
+3. **Two evidence paths for changes.** The prompt asks for current official pricing/docs without publication filters, plus dated announcements/changelogs since the baseline. Publication filters cannot detect silent edits to pricing pages. The model must compare plan, currency, billing period and eligibility, and distinguish a correction to an earlier answer from a proven vendor change. These are model instructions, not a deterministic guarantee that every entity is fully checked.
+4. **Source content and provenance.** Tavily search requests extracted page content internally, keeping the model-facing tool count at one. The first two results include up to 4,000 characters of page text each (snippet fallback); remaining results have up to 1,200 snippet characters each. Evidence includes publication date when available and retrieval time. Cited sources and their supplied evidence are persisted with the answer. Search results and recalled logs are untrusted evidence, never instructions. The provider supports this in the [Search API](https://docs.tavily.com/documentation/api-reference/search).
+5. **Bounded work and honest failure.** A request has a 60-second deadline including model calls and search; model SDK retries are disabled. At most 12 searches are admitted, each with an 8-second attempt timeout and one retry within the shared deadline. Search results cache for 10 minutes, retaining the original retrieval timestamp. Exhaustion forces an evidence-based partial answer; a deadline failure surfaces an error rather than a fabricated completion. Search failures become tool responses.
+6. **Citations before display.** Answer text is buffered so unknown numeric citation IDs can be replaced and flagged before display; only cited sources are shown. This checks provenance, not semantic support. Status events still stream through SSE. An explicit prompt asks for claim-level citations and names what could not be verified.
 
-## Considered and rejected
-- **A `recall_memory` tool.** The brief gives one tool. A deterministic pre-step is also faster and can't be "forgotten" by the model.
-- **Vector/RAG over history.** Overkill; the queries are date-addressed, so a date index is exact.
-- **Multi-agent planner + critic.** 2–3× latency for little gain at this scope.
-- **LLM-based date parsing.** Slower and less reliable than chrono-node.
-- **Framework (LangChain etc.).** The loop is ~80 lines; owning it keeps behaviour explainable.
+## Why this shape / alternatives
 
-## Limits (honest)
-JSON-file store (fine for a demo, not for scale); one server timezone assumed for "last Tuesday"; recall is by date, not by topic ("what did I ask about Postgres?" works only via the model reading in-session history); Tavily snippets are short, so pricing pages sometimes need a second look.
+The harness supplies memory because the brief permits only web search as a tool. Lexical retrieval plus date matching is simple and explainable for a small demo; vector retrieval was deferred, not dismissed as unnecessary for all conversational recall. A multi-agent planner/critic or model-based date parser adds latency and complexity. JSON files avoid database setup; SQLite with FTS is the next step when logs grow. Buffering final answers trades immediate token display for citation validation.
 
-## With another week
-1. **Eval harness**: a fixed set of time-sensitive questions with expected behaviours (baseline found? date filter set? "no record" handled?), run on every change.
-2. **SQLite + FTS** for topic-based recall across sessions, plus per-user timezone.
-3. **Page fetch for top hits** on pricing/changelog questions (snippet → full page), gated by a latency budget.
-4. **Standing watches**: remember "the 5 CRMs we shortlisted" as an entity set and diff against it automatically.
-5. Tune the model split: small model for trivial turns, larger for multi-source synthesis.
+## Limits and next week
+
+Browser identity is an HttpOnly, SameSite cookie, not authenticated accounts or cross-device identity; old unowned logs are deliberately not imported. Clearing the cookie loses access. One configured timezone serves all users. Lexical recall can miss paraphrases, and bounded context can omit evidence. Scanning JSON and unbounded current-chat history do not scale; concurrent writes to the same session need serialization. Extracted pages may be unavailable, truncated, stale or omit relevant pricing details. Citation support and search coverage are not automatically proven. Prompt-injection wrappers reduce confusion but are not a security boundary.
+
+Offline regression tests cover owner isolation, topic recall with adjacent corrections, date resolution across local midnight, page/snippet evidence, caching, aborts and search failures. Next: API-backed evaluations of the three challenge questions with per-claim expected evidence and latency measurements; then SQLite/FTS, account identity, per-user timezone, bounded history and stronger claim-support checks. No live-quality or benchmark claim is made from offline tests alone.

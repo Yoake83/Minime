@@ -1,5 +1,6 @@
 import "dotenv/config";
 import http from "node:http";
+import { randomBytes } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,6 +25,10 @@ http
   .createServer(async (req, res) => {
     try {
       const url = new URL(req.url ?? "/", "http://x");
+      const cookie = req.headers.cookie?.match(/(?:^|;\s*)minimi_owner=([a-f0-9]{32})(?:;|$)/)?.[1];
+      const owner = cookie ?? randomBytes(16).toString("hex");
+      if (!cookie) res.setHeader("Set-Cookie", `minimi_owner=${owner}; HttpOnly; SameSite=Strict; Path=/; Max-Age=31536000`);
+      const scopedId = (id: unknown) => `${owner}_${String(id ?? "default").replace(/[^a-zA-Z0-9-]/g, "").slice(0, 30) || "default"}`;
 
       if (req.method === "GET" && url.pathname === "/") {
         res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
@@ -31,7 +36,7 @@ http
       }
 
       if (req.method === "GET" && url.pathname === "/api/history") {
-        const s = await loadSession(url.searchParams.get("session") ?? "default");
+        const s = await loadSession(scopedId(url.searchParams.get("session")));
         res.writeHead(200, { "Content-Type": "application/json" });
         return res.end(JSON.stringify(s.turns));
       }
@@ -45,7 +50,7 @@ http
         res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
         const send = (e: unknown) => res.write(`data: ${JSON.stringify(e)}\n\n`);
 
-        const session = await loadSession(String(sessionId ?? "default"));
+        const session = await loadSession(scopedId(sessionId));
         const asked = new Date().toISOString();
         try {
           const out = await runAgent({ sessionId: session.id, history: session.turns, message, emit: send });
